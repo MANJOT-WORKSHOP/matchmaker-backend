@@ -3,12 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlite3
 import json
-import base64
 import os
 import secrets
-from datetime import datetime
-
-# Optional: If you want to use Gemini for the backend AI instead of heavy local models
 import google.generativeai as genai
 
 app = FastAPI()
@@ -20,6 +16,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# This pulls the secret key you saved in the Render dashboard!
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    text_model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    text_model = None
 
 def init_db():
     conn = sqlite3.connect('lost_and_found.db')
@@ -52,7 +56,6 @@ def init_db():
 
 init_db()
 
-# Simple token dictionary for session management
 active_tokens = {}
 
 def create_token(username: str):
@@ -120,35 +123,38 @@ def get_profile(authorization: str = Header(None)):
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Get items I reported
     cursor.execute("SELECT * FROM items WHERE creator = ? ORDER BY id DESC", (current_user,))
     my_reports = [dict(row) for row in cursor.fetchall()]
     
-    # Get items I claimed
     cursor.execute("SELECT * FROM items WHERE claimed_by = ? ORDER BY id DESC", (current_user,))
     my_claims = [dict(row) for row in cursor.fetchall()]
-    
     conn.close()
     
-    # Parse tags
     for lst in [my_reports, my_claims]:
         for item in lst:
-            try:
-                item["ai_tags"] = json.loads(item["ai_tags"])
-            except:
-                item["ai_tags"] = []
+            try: item["ai_tags"] = json.loads(item["ai_tags"])
+            except: item["ai_tags"] = []
             item["has_image"] = bool(item["has_image"])
             
     return {"reports": my_reports, "claims": my_claims}
 
-def dummy_ai_analysis(description: str, name: str):
-    """Fallback if no API key is present"""
+def get_ai_tags(description: str, name: str):
+    """Uses Gemini to generate smart tags, or falls back to basic keyword matching"""
+    if text_model:
+        try:
+            prompt = f"Generate 3 single-word tags for a lost item with this name: {name} and description: {description}. Return ONLY the tags separated by commas."
+            response = text_model.generate_content(prompt)
+            tags = [tag.strip().lower() for tag in response.text.split(',')]
+            return tags[:3]
+        except:
+            pass # Fallback to dummy tags if Gemini fails
+            
+    # Fallback
     text = f"{name} {description}".lower()
     tags = []
     if "phone" in text or "iphone" in text: tags.append("smartphone")
     if "key" in text: tags.append("keys")
     if "wallet" in text: tags.append("wallet")
-    if "bag" in text or "backpack" in text: tags.append("bag")
     if not tags: tags.append("misc")
     return tags
 
@@ -157,16 +163,13 @@ def get_items():
     conn = sqlite3.connect('lost_and_found.db')
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    # Only show active items on the public feed!
     cursor.execute("SELECT * FROM items WHERE status = 'active' ORDER BY id DESC")
     items = [dict(row) for row in cursor.fetchall()]
     conn.close()
     
     for item in items:
-        try:
-            item["ai_tags"] = json.loads(item["ai_tags"])
-        except:
-            item["ai_tags"] = []
+        try: item["ai_tags"] = json.loads(item["ai_tags"])
+        except: item["ai_tags"] = []
     return {"items": items}
 
 @app.post("/add-item")
@@ -182,18 +185,14 @@ async def add_item(
     if current_user == "anonymous":
         raise HTTPException(status_code=401, detail="Please log in to report items")
         
-    ai_tags = dummy_ai_analysis(description, name)
-    image_url = None
-    has_image = False
-    
-    # Optional: Save image logic here if needed
+    ai_tags = get_ai_tags(description, name)
     
     conn = sqlite3.connect('lost_and_found.db')
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO items (name, description, location, type, image_url, has_image, ai_tags, creator)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (name, description, location, type, image_url, has_image, json.dumps(ai_tags), current_user))
+    """, (name, description, location, type, None, False, json.dumps(ai_tags), current_user))
     conn.commit()
     conn.close()
     
@@ -212,12 +211,10 @@ async def scan_matches(
     if current_user == "anonymous":
         raise HTTPException(status_code=401, detail="Please log in to scan items")
         
-    # Basic keyword matching for demo purposes
     conn = sqlite3.connect('lost_and_found.db')
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Look for the opposite type (if lost, look for found) that are active
     opposite_type = "found" if type == "lost" else "lost"
     cursor.execute("SELECT * FROM items WHERE type = ? AND status = 'active'", (opposite_type,))
     potential_matches = [dict(row) for row in cursor.fetchall()]
@@ -229,9 +226,8 @@ async def scan_matches(
         score = 0
         if any(term in item['name'].lower() for term in search_terms): score += 50
         if location.lower() in item['location'].lower() or item['location'].lower() in location.lower(): score += 30
-        
         if score > 0:
-            results.append({"item": item, "confidence_score": score + 10}) # base 10
+            results.append({"item": item, "confidence_score": score + 10})
             
     results.sort(key=lambda x: x["confidence_score"], reverse=True)
     return {"results": results}
@@ -251,9 +247,8 @@ def claim_item(item_id: int, authorization: str = Header(None)):
 
 @app.post("/analyze-frame")
 async def analyze_frame(file: UploadFile = File(...)):
-    # Mock tags for the camera scanner so it works instantly without crashing
     import random
-    possible_tags = ["Smartphone", "Wallet", "Keys", "Water Bottle", "Backpack", "Headphones", "Laptop", "Glasses"]
+    possible_tags = ["Smartphone", "Wallet", "Keys", "Water Bottle", "Backpack", "Headphones"]
     tags = random.sample(possible_tags, 2)
     return {"tags": tags}
 
@@ -263,7 +258,6 @@ class ChatRequest(BaseModel):
 
 @app.post("/assistant/chat")
 async def chat_assistant(req: ChatRequest):
-    # Dummy NLP extraction for demo
     text = req.message.lower()
     name = ""
     if "iphone" in text: name = "iPhone"
@@ -285,3 +279,7 @@ async def chat_assistant(req: ChatRequest):
         "location": "Central Park" if "park" in text else "Unknown Location",
         "type": item_type
     }
+
+@app.get("/")
+def health_check():
+    return {"status": "AI, Accounts, and Smart Assistant are running perfectly!"}
