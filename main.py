@@ -5,6 +5,7 @@ import sqlite3
 import json
 import os
 import secrets
+import urllib.request
 import google.generativeai as genai
 
 app = FastAPI()
@@ -17,7 +18,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# This pulls the secret key you saved in the Render dashboard!
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -139,7 +139,6 @@ def get_profile(authorization: str = Header(None)):
     return {"reports": my_reports, "claims": my_claims}
 
 def get_ai_tags(description: str, name: str):
-    """Uses Gemini to generate smart tags, or falls back to basic keyword matching"""
     if text_model:
         try:
             prompt = f"Generate 3 single-word tags for a lost item with this name: {name} and description: {description}. Return ONLY the tags separated by commas."
@@ -147,9 +146,8 @@ def get_ai_tags(description: str, name: str):
             tags = [tag.strip().lower() for tag in response.text.split(',')]
             return tags[:3]
         except:
-            pass # Fallback to dummy tags if Gemini fails
+            pass 
             
-    # Fallback
     text = f"{name} {description}".lower()
     tags = []
     if "phone" in text or "iphone" in text: tags.append("smartphone")
@@ -239,11 +237,52 @@ def claim_item(item_id: int, authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Must be logged in to claim items")
         
     conn = sqlite3.connect('lost_and_found.db')
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
+    
+    # Fetch the item and find out who originally posted it
+    c.execute("SELECT name, creator FROM items WHERE id = ?", (item_id,))
+    item = c.fetchone()
+    
+    if item:
+        item_name = item['name']
+        creator_username = item['creator']
+        
+        # Look up the creator's email address in the users table
+        c.execute("SELECT email FROM users WHERE username = ?", (creator_username,))
+        user_row = c.fetchone()
+        
+        if user_row:
+            creator_email = user_row['email']
+            
+            # Fire off the real email via Resend API
+            resend_key = os.environ.get("RESEND_API_KEY")
+            if resend_key:
+                try:
+                    email_data = {
+                        "from": "AI MatchMaker <onboarding@resend.dev>",
+                        "to": [creator_email],
+                        "subject": f"🎉 Good News: Someone claimed your {item_name}!",
+                        "html": f"<h3>Great news, {creator_username}!</h3><p>User <b>{current_user}</b> just successfully claimed your {item_name}. Log into your MatchMaker profile to contact them and arrange a return!</p>"
+                    }
+                    req = urllib.request.Request(
+                        "https://api.resend.com/emails",
+                        data=json.dumps(email_data).encode('utf-8'),
+                        headers={
+                            "Authorization": f"Bearer {resend_key}",
+                            "Content-Type": "application/json"
+                        }
+                    )
+                    urllib.request.urlopen(req)
+                    print(f"Email successfully sent to {creator_email}")
+                except Exception as e:
+                    print(f"Email failed to send: {e}")
+
+    # Mark the item as claimed in the database
     c.execute("UPDATE items SET status = 'claimed', claimed_by = ? WHERE id = ?", (current_user, item_id))
     conn.commit()
     conn.close()
-    return {"message": "Item claimed successfully"}
+    return {"message": "Item claimed successfully and email sent!"}
 
 @app.post("/analyze-frame")
 async def analyze_frame(file: UploadFile = File(...)):
