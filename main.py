@@ -51,6 +51,12 @@ def init_db():
             claimed_by TEXT
         )
     ''')
+    
+    try:
+        c.execute("ALTER TABLE items ADD COLUMN bounty INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass # Column already exists, safe to ignore
+        
     conn.commit()
     conn.close()
 
@@ -135,6 +141,7 @@ def get_profile(authorization: str = Header(None)):
             try: item["ai_tags"] = json.loads(item["ai_tags"])
             except: item["ai_tags"] = []
             item["has_image"] = bool(item["has_image"])
+            item["bounty"] = item.get("bounty", 0)
             
     return {"reports": my_reports, "claims": my_claims}
 
@@ -168,6 +175,7 @@ def get_items():
     for item in items:
         try: item["ai_tags"] = json.loads(item["ai_tags"])
         except: item["ai_tags"] = []
+        item["bounty"] = item.get("bounty", 0)
     return {"items": items}
 
 @app.post("/add-item")
@@ -176,7 +184,7 @@ async def add_item(
     description: str = Form(...),
     location: str = Form(...),
     type: str = Form(...),
-    file: UploadFile = File(None),
+    bounty: int = Form(0),    file: UploadFile = File(None),
     authorization: str = Header(None)
 ):
     current_user = get_user_from_token(authorization)
@@ -188,9 +196,9 @@ async def add_item(
     conn = sqlite3.connect('lost_and_found.db')
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO items (name, description, location, type, image_url, has_image, ai_tags, creator)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (name, description, location, type, None, False, json.dumps(ai_tags), current_user))
+        INSERT INTO items (name, description, location, type, image_url, has_image, ai_tags, creator, bounty)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (name, description, location, type, None, False, json.dumps(ai_tags), current_user, bounty))
     conn.commit()
     conn.close()
     
@@ -202,7 +210,7 @@ async def scan_matches(
     description: str = Form(...),
     location: str = Form(...),
     type: str = Form(...),
-    file: UploadFile = File(None),
+    bounty: int = Form(0),    file: UploadFile = File(None),
     authorization: str = Header(None)
 ):
     current_user = get_user_from_token(authorization)
@@ -213,6 +221,15 @@ async def scan_matches(
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
+    # Save the lost item first
+    ai_tags = get_ai_tags(description, name)
+    cursor.execute("""
+        INSERT INTO items (name, description, location, type, image_url, has_image, ai_tags, creator, bounty)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (name, description, location, type, None, False, json.dumps(ai_tags), current_user, bounty))
+    conn.commit()
+    
+    # Scan for matches
     opposite_type = "found" if type == "lost" else "lost"
     cursor.execute("SELECT * FROM items WHERE type = ? AND status = 'active'", (opposite_type,))
     potential_matches = [dict(row) for row in cursor.fetchall()]
@@ -225,6 +242,7 @@ async def scan_matches(
         if any(term in item['name'].lower() for term in search_terms): score += 50
         if location.lower() in item['location'].lower() or item['location'].lower() in location.lower(): score += 30
         if score > 0:
+            item["bounty"] = item.get("bounty", 0)
             results.append({"item": item, "confidence_score": score + 10})
             
     results.sort(key=lambda x: x["confidence_score"], reverse=True)
@@ -240,30 +258,30 @@ def claim_item(item_id: int, authorization: str = Header(None)):
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     
-    # Fetch the item and find out who originally posted it
-    c.execute("SELECT name, creator FROM items WHERE id = ?", (item_id,))
+    c.execute("SELECT name, creator, bounty, type FROM items WHERE id = ?", (item_id,))
     item = c.fetchone()
     
     if item:
         item_name = item['name']
         creator_username = item['creator']
+        bounty_amount = item['bounty']
         
-        # Look up the creator's email address in the users table
         c.execute("SELECT email FROM users WHERE username = ?", (creator_username,))
         user_row = c.fetchone()
         
         if user_row:
             creator_email = user_row['email']
-            
-            # Fire off the real email via Resend API
             resend_key = os.environ.get("RESEND_API_KEY")
+            
+            bounty_msg = f"<p><b>Good news!</b> We have released the ${bounty_amount} reward from escrow to their account.</p>" if bounty_amount > 0 else ""
+            
             if resend_key:
                 try:
                     email_data = {
                         "from": "AI MatchMaker <onboarding@resend.dev>",
                         "to": [creator_email],
-                        "subject": f"🎉 Good News: Someone claimed your {item_name}!",
-                        "html": f"<h3>Great news, {creator_username}!</h3><p>User <b>{current_user}</b> just successfully claimed your {item_name}. Log into your MatchMaker profile to contact them and arrange a return!</p>"
+                        "subject": f"🎉 MatchMaker Update: Someone claimed your {item_name}!",
+                        "html": f"<h3>Great news, {creator_username}!</h3><p>User <b>{current_user}</b> just successfully identified your {item_name}.</p>{bounty_msg}<p>Log into your MatchMaker profile to contact them and arrange a meeting!</p>"
                     }
                     req = urllib.request.Request(
                         "https://api.resend.com/emails",
@@ -274,11 +292,9 @@ def claim_item(item_id: int, authorization: str = Header(None)):
                         }
                     )
                     urllib.request.urlopen(req)
-                    print(f"Email successfully sent to {creator_email}")
                 except Exception as e:
                     print(f"Email failed to send: {e}")
 
-    # Mark the item as claimed in the database
     c.execute("UPDATE items SET status = 'claimed', claimed_by = ? WHERE id = ?", (current_user, item_id))
     conn.commit()
     conn.close()
@@ -321,4 +337,4 @@ async def chat_assistant(req: ChatRequest):
 
 @app.get("/")
 def health_check():
-    return {"status": "AI, Accounts, and Smart Assistant are running perfectly!"}
+    return {"status": "AI, Accounts, Escrow, and Smart Assistant are running perfectly!"}
