@@ -1,9 +1,11 @@
 from fastapi import FastAPI, HTTPException, Form, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import sqlite3
 import json
 import os
+import uuid
 import secrets
 import urllib.request
 import google.generativeai as genai
@@ -24,6 +26,10 @@ if GEMINI_API_KEY:
     text_model = genai.GenerativeModel('gemini-1.5-flash')
 else:
     text_model = None
+
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 def init_db():
     conn = sqlite3.connect('lost_and_found.db')
@@ -193,12 +199,24 @@ async def add_item(
         
     ai_tags = get_ai_tags(description, name)
     
+    image_url = None
+    has_image = False
+    if file and file.filename:
+        ext = os.path.splitext(file.filename)[1] or ".jpg"
+        unique_name = f"{uuid.uuid4().hex}{ext}"
+        file_path = os.path.join(UPLOAD_DIR, unique_name)
+        contents = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        image_url = f"/uploads/{unique_name}"
+        has_image = True
+    
     conn = sqlite3.connect('lost_and_found.db')
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO items (name, description, location, type, image_url, has_image, ai_tags, creator, bounty)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (name, description, location, type, None, False, json.dumps(ai_tags), current_user, bounty))
+    """, (name, description, location, type, image_url, has_image, json.dumps(ai_tags), current_user, bounty))
     conn.commit()
     conn.close()
     
@@ -223,10 +241,23 @@ async def scan_matches(
     
     # Save the lost item first
     ai_tags = get_ai_tags(description, name)
+    
+    image_url = None
+    has_image = False
+    if file and file.filename:
+        ext = os.path.splitext(file.filename)[1] or ".jpg"
+        unique_name = f"{uuid.uuid4().hex}{ext}"
+        file_path = os.path.join(UPLOAD_DIR, unique_name)
+        contents = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        image_url = f"/uploads/{unique_name}"
+        has_image = True
+    
     cursor.execute("""
         INSERT INTO items (name, description, location, type, image_url, has_image, ai_tags, creator, bounty)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (name, description, location, type, None, False, json.dumps(ai_tags), current_user, bounty))
+    """, (name, description, location, type, image_url, has_image, json.dumps(ai_tags), current_user, bounty))
     conn.commit()
     
     # Scan for matches
@@ -302,11 +333,38 @@ def claim_item(item_id: int, authorization: str = Header(None)):
 
 @app.post("/analyze-frame")
 async def analyze_frame(file: UploadFile = File(...)):
-    import random
-    possible_tags = ["Smartphone", "Wallet", "Keys", "Water Bottle", "Backpack", "Headphones"]
-    tags = random.sample(possible_tags, 2)
-    return {"tags": tags}
+    if not text_model:
+        return {"tags": ["AI key not configured"]}
 
+    try:
+        from PIL import Image
+        import io
+
+        image_data = await file.read()
+        img = Image.open(io.BytesIO(image_data))
+
+        prompt = (
+            "You are an object detection assistant for a lost-and-found app. "
+            "Look at this image and identify any visible everyday objects that "
+            "someone might lose or find (e.g. phone, wallet, keys, bag, laptop, "
+            "bottle, headphones, glasses, watch, umbrella, book, clothing, etc). "
+            "Return ONLY a comma-separated list of detected item names, maximum "
+            "4 items. Keep each name short (1-2 words). "
+            "If no recognizable items are visible, respond with exactly: Scanning"
+        )
+
+        response = text_model.generate_content([prompt, img])
+        tags_text = response.text.strip()
+
+        if "scanning" in tags_text.lower() or not tags_text:
+            return {"tags": ["Scanning..."]}
+
+        tags = [t.strip().title() for t in tags_text.split(",") if t.strip()]
+        return {"tags": tags[:4] if tags else ["Scanning..."]}
+
+    except Exception as e:
+        print(f"Frame analysis error: {e}")
+        return {"tags": ["Analyzing..."]}
 class ChatRequest(BaseModel):
     message: str
     history: list
@@ -314,24 +372,113 @@ class ChatRequest(BaseModel):
 @app.post("/assistant/chat")
 async def chat_assistant(req: ChatRequest):
     text = req.message.lower()
+
+    # --- 1. Detect item name (expanded vocabulary) ---
     name = ""
-    if "iphone" in text: name = "iPhone"
-    elif "wallet" in text: name = "Wallet"
-    elif "keys" in text: name = "Keys"
-    
+    item_keywords = [
+        ("airpods", "AirPods"), ("apple watch", "Apple Watch"),
+        ("iphone", "iPhone"), ("ipad", "iPad"), ("macbook", "MacBook"),
+        ("samsung", "Samsung Phone"), ("pixel", "Pixel Phone"),
+        ("smartphone", "Smartphone"), ("phone", "Phone"),
+        ("laptop", "Laptop"), ("chromebook", "Chromebook"), ("tablet", "Tablet"),
+        ("wallet", "Wallet"), ("purse", "Purse"),
+        ("keychain", "Keychain"), ("keys", "Keys"), ("key", "Keys"),
+        ("backpack", "Backpack"), ("handbag", "Handbag"), ("bag", "Bag"),
+        ("headphones", "Headphones"), ("earbuds", "Earbuds"),
+        ("sunglasses", "Sunglasses"), ("glasses", "Glasses"),
+        ("watch", "Watch"), ("umbrella", "Umbrella"),
+        ("water bottle", "Water Bottle"), ("bottle", "Bottle"),
+        ("charger", "Charger"), ("usb", "USB Drive"),
+        ("necklace", "Necklace"), ("bracelet", "Bracelet"), ("ring", "Ring"),
+        ("camera", "Camera"), ("notebook", "Notebook"), ("book", "Book"),
+        ("jacket", "Jacket"), ("hoodie", "Hoodie"), ("coat", "Coat"),
+        ("hat", "Hat"), ("cap", "Cap"), ("scarf", "Scarf"), ("gloves", "Gloves"),
+        ("id card", "ID Card"), ("passport", "Passport"), ("license", "License"),
+        ("hard drive", "Hard Drive"), ("mouse", "Mouse"),
+    ]
+    for keyword, item_name in item_keywords:
+        if keyword in text:
+            name = item_name
+            break
+
+    # --- 2. Detect type (lost / found) ---
     item_type = "unknown"
-    if "lost" in text: item_type = "lost"
-    elif "found" in text: item_type = "found"
-    
-    reply = "I understand you are talking about an item. Can you tell me exactly where it was?"
-    if name:
-        reply = f"I've noted that you are talking about a {name}. Where did this happen?"
-        
+    if any(w in text for w in ["lost", "missing", "misplaced", "can't find", "cannot find", "lose"]):
+        item_type = "lost"
+    elif any(w in text for w in ["found", "picked up", "spotted", "came across"]):
+        item_type = "found"
+
+    # --- 3. Detect location ---
+    location = ""
+
+    # Check if the bot's last reply asked for a location (so we can treat the
+    # whole message as a location answer when no item/type was detected).
+    bot_asked_where = False
+    for msg in reversed(req.history):
+        if msg.get("role") == "model":
+            last_bot = msg.get("text", "").lower()
+            bot_asked_where = any(w in last_bot for w in ["where", "location", "happen"])
+            break
+
+    if not name and item_type == "unknown" and bot_asked_where and len(req.message.strip()) > 2:
+        # The user is replying purely with a location
+        location = req.message.strip().rstrip(".,!?;:")
+    else:
+        # Try to extract a location after a preposition
+        preps = [
+            "at the ", "at ", "in the ", "in ", "near the ", "near ",
+            "around the ", "around ", "by the ", "by ", "on the ", "on ",
+            "from the ", "from ", "outside the ", "outside ",
+            "inside the ", "inside ", "next to the ", "next to ",
+        ]
+        preps.sort(key=len, reverse=True)
+        for prep in preps:
+            if prep in text:
+                idx = text.rfind(prep)
+                loc_candidate = req.message[idx + len(prep):].strip().rstrip(".,!?;:")
+                if len(loc_candidate) > 2:
+                    location = loc_candidate
+                    break
+
+    # --- 4. Only return description for substantive messages ---
+    description = req.message if (name or len(req.message) > 20) else ""
+
+    # --- 5. Build a contextual reply ---
+    if name and location and item_type != "unknown":
+        reply = (f"Perfect! I've captured everything: a {item_type} **{name}** "
+                 f"at **{location}**. Review the details on the right panel and "
+                 f"hit **Publish Drafted Report** when you're ready!")
+    elif name and location:
+        reply = (f"Got it — a **{name}** at **{location}**. "
+                 f"Was this item **lost** or **found**?")
+    elif name and item_type != "unknown":
+        reply = (f"Noted — a {item_type} **{name}**. "
+                 f"**Where** exactly did this happen? "
+                 f"(e.g., 'at the train station', 'in the cafeteria')")
+    elif name:
+        reply = (f"I've identified the item as a **{name}**. "
+                 f"Was it lost or found? And where did it happen?")
+    elif location and item_type != "unknown":
+        reply = (f"A {item_type} item at **{location}**. "
+                 f"What **item** are we talking about? "
+                 f"(e.g., 'black iPhone', 'silver keys', 'red backpack')")
+    elif location:
+        reply = (f"Location saved: **{location}**. "
+                 f"What **item** are we talking about, and was it lost or found?")
+    elif item_type != "unknown":
+        reply = (f"Understood, you {item_type} something. "
+                 f"Can you describe the **item**? "
+                 f"(e.g., 'a black wallet', 'car keys with a blue keychain')")
+    else:
+        reply = ("I'd love to help! Try describing what happened, like: "
+                 "'I lost my black wallet at the train station' "
+                 "— and I'll extract the details automatically.")
+
     return {
         "reply": reply,
         "name": name,
-        "description": req.message,
-        "location": "Central Park" if "park" in text else "Unknown Location",
+        "description": description,
+        "location": location,
         "type": item_type
     }
 
